@@ -19,6 +19,7 @@ from dropbox.files import UploadSessionCursor
 from dropbox.files import WriteMode
 
 from storages.base import BaseStorage
+from storages.utils import get_available_overwrite_name
 from storages.utils import setting
 
 _DEFAULT_TIMEOUT = 100
@@ -29,7 +30,17 @@ class DropboxStorageException(Exception):
     pass
 
 
+class SuspiciousFileOperation(Exception):
+    pass
+
+
 DropBoxStorageException = DropboxStorageException
+
+
+def removeprefix(prefix, name):
+    if name.startswith(prefix):
+        name = name[len(prefix):]
+    return name
 
 
 class DropboxFile(File):
@@ -73,12 +84,10 @@ class DropboxStorage(BaseStorage):
     CHUNK_SIZE = 4 * 1024 * 1024
 
     def __init__(self, oauth2_access_token=None, **settings):
-        if oauth2_access_token is not None:
-            settings["oauth2_access_token"] = oauth2_access_token
-        super().__init__(**settings)
+        super().__init__(oauth2_access_token=oauth2_access_token, **settings)
 
         if self.oauth2_access_token is None and not all(
-            [self.app_key, self.app_secret, self.oauth2_refresh_token]
+                [self.app_key, self.app_secret, self.oauth2_refresh_token]
         ):
             raise ImproperlyConfigured(
                 "You must configure an auth token at"
@@ -117,17 +126,34 @@ class DropboxStorage(BaseStorage):
         }
 
     def _full_path(self, name):
-        if name == "/":
-            name = ""
-        return safe_join(self.root_path, name).replace("\\", "/")
+        import os
+        if name == '/':
+            name = ''
+
+        # If the machine is windows do not append the drive letter to file path
+        if os.name == 'nt':
+            final_path = os.path.join(self.root_path, name).replace('\\', '/')
+
+            # Separator on linux system
+            sep = '//'
+            base_path = self.root_path
+
+            if (not os.path.normcase(final_path).startswith(os.path.normcase(base_path + sep)) and
+                    os.path.normcase(final_path) != os.path.normcase(base_path) and
+                    os.path.dirname(os.path.normcase(base_path)) != os.path.normcase(base_path)):
+                raise SuspiciousFileOperation(
+                    'The joined path ({}) is located outside of the base path '
+                    'component ({})'.format(final_path, base_path))
+
+            return final_path
+
+        else:
+            return safe_join(self.root_path, name).replace('\\', '/')
 
     def delete(self, name):
         self.client.files_delete(self._full_path(name))
 
     def exists(self, name):
-        if self.write_mode == "overwrite":
-            return False
-
         try:
             return bool(self.client.files_get_metadata(self._full_path(name)))
         except ApiError:
@@ -172,7 +198,10 @@ class DropboxStorage(BaseStorage):
         else:
             self._chunked_upload(content, self._full_path(name))
         content.close()
-        return name
+        # .save() validates the filename isn't absolute but Dropbox requires an
+        # absolute filename.  Work with the absolute name internally but strip it
+        # off before passing up-the-chain.
+        return removeprefix(self.root_path, name).lstrip("/")
 
     def _chunked_upload(self, content, dest_path):
         upload_session = self.client.files_upload_session_start(
@@ -193,6 +222,13 @@ class DropboxStorage(BaseStorage):
                     content.read(self.CHUNK_SIZE), cursor
                 )
                 cursor.offset = content.tell()
+
+    def get_available_name(self, name, max_length=None):
+        """Overwrite existing file with the same name."""
+        name = self._full_path(name)
+        if self.write_mode == "overwrite":
+            return get_available_overwrite_name(name, max_length)
+        return super().get_available_name(name, max_length)
 
 
 DropBoxStorage = DropboxStorage
