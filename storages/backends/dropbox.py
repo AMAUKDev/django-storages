@@ -29,7 +29,6 @@ _DEFAULT_MODE = "add"
 class DropboxStorageException(Exception):
     pass
 
-
 class SuspiciousFileOperation(Exception):
     pass
 
@@ -39,7 +38,7 @@ DropBoxStorageException = DropboxStorageException
 
 def removeprefix(prefix, name):
     if name.startswith(prefix):
-        name = name[len(prefix):]
+        name = name[len(prefix) :]
     return name
 
 
@@ -87,7 +86,7 @@ class DropboxStorage(BaseStorage):
         super().__init__(oauth2_access_token=oauth2_access_token, **settings)
 
         if self.oauth2_access_token is None and not all(
-                [self.app_key, self.app_secret, self.oauth2_refresh_token]
+            [self.app_key, self.app_secret, self.oauth2_refresh_token]
         ):
             raise ImproperlyConfigured(
                 "You must configure an auth token at"
@@ -129,11 +128,11 @@ class DropboxStorage(BaseStorage):
         import os
         if name == '/':
             name = ''
-
+        
         # If the machine is windows do not append the drive letter to file path
         if os.name == 'nt':
             final_path = os.path.join(self.root_path, name).replace('\\', '/')
-
+            
             # Separator on linux system
             sep = '//'
             base_path = self.root_path
@@ -144,9 +143,9 @@ class DropboxStorage(BaseStorage):
                 raise SuspiciousFileOperation(
                     'The joined path ({}) is located outside of the base path '
                     'component ({})'.format(final_path, base_path))
-
+            
             return final_path
-
+        
         else:
             return safe_join(self.root_path, name).replace('\\', '/')
 

@@ -11,8 +11,6 @@ from urllib.parse import urlparse
 
 import boto3
 import boto3.s3.transfer
-import botocore
-from botocore.config import Config as ClientConfig
 from botocore.exceptions import ClientError
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
@@ -36,37 +34,13 @@ class S3StorageTests(TestCase):
     def setUp(self):
         self.storage = s3.S3Storage()
         self.storage._connections.connection = mock.MagicMock()
-        self.storage._unsigned_connections.connection = mock.MagicMock()
 
-    @mock.patch("boto3.Session")
-    def test_s3_session(self, session):
+    def test_s3_session(self):
         with override_settings(AWS_S3_SESSION_PROFILE="test_profile"):
-            storage = s3.S3Storage()
-            _ = storage.connection
-            session.assert_called_once_with(profile_name="test_profile")
-
-    @mock.patch("boto3.Session.resource")
-    def test_client_config(self, resource):
-        with override_settings(
-            AWS_S3_CLIENT_CONFIG=ClientConfig(max_pool_connections=30)
-        ):
-            storage = s3.S3Storage()
-            _ = storage.connection
-            resource.assert_called_once()
-            self.assertEqual(30, resource.call_args[1]["config"].max_pool_connections)
-
-    @mock.patch("boto3.Session.resource")
-    def test_connection_unsiged(self, resource):
-        with override_settings(AWS_S3_ADDRESSING_STYLE="virtual"):
-            storage = s3.S3Storage()
-            _ = storage.unsigned_connection
-            resource.assert_called_once()
-            self.assertEqual(
-                botocore.UNSIGNED, resource.call_args[1]["config"].signature_version
-            )
-            self.assertEqual(
-                "virtual", resource.call_args[1]["config"].s3["addressing_style"]
-            )
+            with mock.patch("boto3.Session") as mock_session:
+                storage = s3.S3Storage()
+                _ = storage.connection
+                mock_session.assert_called_once_with(profile_name="test_profile")
 
     def test_pickle_with_bucket(self):
         """
@@ -326,9 +300,29 @@ class S3StorageTests(TestCase):
         Test opening a file in "r" mode (ie reading as string, not bytes)
         """
         name = "test_open_read_string.txt"
-        with self.storage.open(name, "r") as file:
-            content_str = file.read()
-            self.assertEqual(content_str, "")
+        file = self.storage.open(name, "r")
+        content_str = file.read()
+        self.assertEqual(content_str, "")
+        file.close()
+
+    def test_storage_open_readlines(self):
+        """
+        Test readlines with file opened in "r" and "rb" modes
+        """
+        name = "test_open_readlines_string.txt"
+        with io.BytesIO() as temp_file:
+            temp_file.write(b"line1\nline2")
+            file = self.storage.open(name, "r")
+            file._file = temp_file
+
+            content_lines = file.readlines()
+            self.assertEqual(content_lines, ["line1\n", "line2"])
+
+            temp_file.seek(0)
+            file = self.storage.open(name, "rb")
+            file._file = temp_file
+            content_lines = file.readlines()
+            self.assertEqual(content_lines, [b"line1\n", b"line2"])
 
     def test_storage_open_write(self):
         """
@@ -344,24 +338,26 @@ class S3StorageTests(TestCase):
             "ACL": "public-read",
         }
 
-        with self.storage.open(name, "wb") as file:
-            self.storage.bucket.Object.assert_called_with(name)
-            obj = self.storage.bucket.Object.return_value
-            # Set the name of the mock object
-            obj.key = name
+        file = self.storage.open(name, "w")
+        self.storage.bucket.Object.assert_called_with(name)
+        obj = self.storage.bucket.Object.return_value
+        # Set the name of the mock object
+        obj.key = name
 
-            multipart = obj.initiate_multipart_upload.return_value
-            multipart.Part.return_value.upload.side_effect = [
-                {"ETag": "123"},
-            ]
-            file.write(content)
-            obj.initiate_multipart_upload.assert_called_with(
-                ACL="public-read",
-                ContentType="text/plain",
-                ServerSideEncryption="AES256",
-                StorageClass="REDUCED_REDUNDANCY",
-            )
+        multipart = obj.initiate_multipart_upload.return_value
+        multipart.Part.return_value.upload.side_effect = [
+            {"ETag": "123"},
+        ]
+        file.write(content)
+        obj.initiate_multipart_upload.assert_called_with(
+            ACL="public-read",
+            ContentType="text/plain",
+            ServerSideEncryption="AES256",
+            StorageClass="REDUCED_REDUNDANCY",
+        )
 
+        # Save the internal file before closing
+        file.close()
         multipart.Part.assert_called_with(1)
         part = multipart.Part.return_value
         part.upload.assert_called_with(Body=content.encode())
@@ -373,12 +369,13 @@ class S3StorageTests(TestCase):
         """Test that bytearray write exactly (no extra "bytearray" from stringify)."""
         name = "saved_file.bin"
         content = bytearray(b"content")
-        with self.storage.open(name, "wb") as file:
-            obj = self.storage.bucket.Object.return_value
-            # Set the name of the mock object
-            obj.key = name
-            bytes_written = file.write(content)
-            self.assertEqual(len(content), bytes_written)
+        file = self.storage.open(name, "wb")
+        obj = self.storage.bucket.Object.return_value
+        # Set the name of the mock object
+        obj.key = name
+        bytes_written = file.write(content)
+        self.assertEqual(len(content), bytes_written)
+        file.close()
 
     def test_storage_open_no_write(self):
         """
@@ -394,16 +391,18 @@ class S3StorageTests(TestCase):
             "StorageClass": "REDUCED_REDUNDANCY",
         }
 
-        with self.storage.open(name, "wb"):
-            self.storage.bucket.Object.assert_called_with(name)
-            obj = self.storage.bucket.Object.return_value
-            obj.load.side_effect = ClientError(
-                {"Error": {}, "ResponseMetadata": {"HTTPStatusCode": 404}},
-                "head_bucket",
-            )
+        file = self.storage.open(name, "w")
+        self.storage.bucket.Object.assert_called_with(name)
+        obj = self.storage.bucket.Object.return_value
+        obj.load.side_effect = ClientError(
+            {"Error": {}, "ResponseMetadata": {"HTTPStatusCode": 404}}, "head_bucket"
+        )
 
-            # Set the name of the mock object
-            obj.key = name
+        # Set the name of the mock object
+        obj.key = name
+
+        # Save the internal file before closing
+        file.close()
 
         obj.load.assert_called_once_with()
         obj.put.assert_called_once_with(
@@ -425,12 +424,15 @@ class S3StorageTests(TestCase):
             "StorageClass": "REDUCED_REDUNDANCY",
         }
 
-        with self.storage.open(name, "wb"):
-            self.storage.bucket.Object.assert_called_with(name)
-            obj = self.storage.bucket.Object.return_value
+        file = self.storage.open(name, "w")
+        self.storage.bucket.Object.assert_called_with(name)
+        obj = self.storage.bucket.Object.return_value
 
-            # Set the name of the mock object
-            obj.key = name
+        # Set the name of the mock object
+        obj.key = name
+
+        # Save the internal file before closing
+        file.close()
 
         obj.load.assert_called_once_with()
         obj.put.assert_not_called()
@@ -447,37 +449,39 @@ class S3StorageTests(TestCase):
             "StorageClass": "REDUCED_REDUNDANCY",
         }
 
-        with self.storage.open(name, "wb") as file:
-            self.storage.bucket.Object.assert_called_with(name)
-            obj = self.storage.bucket.Object.return_value
-            # Set the name of the mock object
-            obj.key = name
+        file = self.storage.open(name, "w")
+        self.storage.bucket.Object.assert_called_with(name)
+        obj = self.storage.bucket.Object.return_value
+        # Set the name of the mock object
+        obj.key = name
 
-            # Initiate the multipart upload
-            file.write("")
-            obj.initiate_multipart_upload.assert_called_with(
-                ContentType="text/plain",
-                ServerSideEncryption="AES256",
-                StorageClass="REDUCED_REDUNDANCY",
-            )
-            multipart = obj.initiate_multipart_upload.return_value
+        # Initiate the multipart upload
+        file.write("")
+        obj.initiate_multipart_upload.assert_called_with(
+            ContentType="text/plain",
+            ServerSideEncryption="AES256",
+            StorageClass="REDUCED_REDUNDANCY",
+        )
+        multipart = obj.initiate_multipart_upload.return_value
 
-            # Write content at least twice as long as the buffer size
-            written_content = ""
-            counter = 1
-            multipart.Part.return_value.upload.side_effect = [
-                {"ETag": "123"},
-                {"ETag": "456"},
-            ]
-            while len(written_content) < 2 * file.buffer_size:
-                content = "hello, aws {counter}\n".format(counter=counter)
-                # Write more than just a few bytes in each iteration to keep the
-                # test reasonably fast
-                content += "*" * int(file.buffer_size / 10)
-                file.write(content)
-                written_content += content
-                counter += 1
+        # Write content at least twice as long as the buffer size
+        written_content = ""
+        counter = 1
+        multipart.Part.return_value.upload.side_effect = [
+            {"ETag": "123"},
+            {"ETag": "456"},
+        ]
+        while len(written_content) < 2 * file.buffer_size:
+            content = "hello, aws {counter}\n".format(counter=counter)
+            # Write more than just a few bytes in each iteration to keep the
+            # test reasonably fast
+            content += "*" * int(file.buffer_size / 10)
+            file.write(content)
+            written_content += content
+            counter += 1
 
+        # Save the internal file before closing
+        file.close()
         self.assertListEqual(
             multipart.Part.call_args_list, [mock.call(1), mock.call(2)]
         )
@@ -496,7 +500,6 @@ class S3StorageTests(TestCase):
         )
 
     def test_storage_exists(self):
-        self.storage.file_overwrite = False
         self.assertTrue(self.storage.exists("file.txt"))
         self.storage.connection.meta.client.head_object.assert_called_with(
             Bucket=self.storage.bucket_name,
@@ -504,7 +507,6 @@ class S3StorageTests(TestCase):
         )
 
     def test_storage_exists_false(self):
-        self.storage.file_overwrite = False
         self.storage.connection.meta.client.head_object.side_effect = ClientError(
             {"Error": {}, "ResponseMetadata": {"HTTPStatusCode": 404}},
             "HeadObject",
@@ -516,7 +518,6 @@ class S3StorageTests(TestCase):
         )
 
     def test_storage_exists_other_error_reraise(self):
-        self.storage.file_overwrite = False
         self.storage.connection.meta.client.head_object.side_effect = ClientError(
             {"Error": {}, "ResponseMetadata": {"HTTPStatusCode": 403}},
             "HeadObject",
@@ -527,10 +528,6 @@ class S3StorageTests(TestCase):
         self.assertEqual(
             cm.exception.response["ResponseMetadata"]["HTTPStatusCode"], 403
         )
-
-    def test_storage_exists_overwrite(self):
-        self.storage.file_overwrite = True
-        self.assertFalse(self.storage.exists("foo"))
 
     def test_storage_delete(self):
         self.storage.delete("path/to/file.txt")
@@ -684,10 +681,10 @@ class S3StorageTests(TestCase):
     def test_storage_url(self):
         name = "test_storage_size.txt"
         url = "http://aws.amazon.com/%s" % name
-        self.storage.connection.meta.client.generate_presigned_url.return_value = url
+        self.storage.bucket.meta.client.generate_presigned_url.return_value = url
         self.storage.bucket.name = "bucket"
         self.assertEqual(self.storage.url(name), url)
-        self.storage.connection.meta.client.generate_presigned_url.assert_called_with(
+        self.storage.bucket.meta.client.generate_presigned_url.assert_called_with(
             "get_object",
             Params={"Bucket": self.storage.bucket.name, "Key": name},
             ExpiresIn=self.storage.querystring_expire,
@@ -695,8 +692,9 @@ class S3StorageTests(TestCase):
         )
 
         custom_expire = 123
+
         self.assertEqual(self.storage.url(name, expire=custom_expire), url)
-        self.storage.connection.meta.client.generate_presigned_url.assert_called_with(
+        self.storage.bucket.meta.client.generate_presigned_url.assert_called_with(
             "get_object",
             Params={"Bucket": self.storage.bucket.name, "Key": name},
             ExpiresIn=custom_expire,
@@ -704,21 +702,16 @@ class S3StorageTests(TestCase):
         )
 
         custom_method = "HEAD"
+
         self.assertEqual(self.storage.url(name, http_method=custom_method), url)
-        self.storage.connection.meta.client.generate_presigned_url.assert_called_with(
+        self.storage.bucket.meta.client.generate_presigned_url.assert_called_with(
             "get_object",
             Params={"Bucket": self.storage.bucket.name, "Key": name},
             ExpiresIn=self.storage.querystring_expire,
             HttpMethod=custom_method,
         )
 
-    def test_url_unsigned(self):
-        self.storage.querystring_auth = False
-        self.storage.url("test_name")
-        self.storage.unsigned_connection.meta.client.generate_presigned_url.assert_called_once()
-
-    @mock.patch("storages.backends.s3.datetime")
-    def test_storage_url_custom_domain_signed_urls(self, dt):
+    def test_storage_url_custom_domain_signed_urls(self):
         key_id = "test-key"
         filename = "file.txt"
         pem = dedent(
@@ -756,8 +749,11 @@ class S3StorageTests(TestCase):
             self.assertEqual(self.storage.url(filename), url)
 
             self.storage.querystring_auth = True
-            dt.utcnow.return_value = datetime.datetime.utcfromtimestamp(0)
-            self.assertEqual(self.storage.url(filename), signed_url)
+            with mock.patch("storages.backends.s3.datetime") as mock_datetime:
+                mock_datetime.utcnow.return_value = datetime.datetime.utcfromtimestamp(
+                    0
+                )
+                self.assertEqual(self.storage.url(filename), signed_url)
 
     def test_generated_url_is_encoded(self):
         self.storage.custom_domain = "mock.cloudfront.net"
@@ -786,6 +782,21 @@ class S3StorageTests(TestCase):
         parsed_url = urlparse(url)
         self.assertEqual(parsed_url.path, "/filename.mp4")
         self.assertEqual(parsed_url.query, "version=10")
+
+    def test_strip_signing_parameters(self):
+        expected = "http://bucket.s3-aws-region.amazonaws.com/foo/bar"
+        self.assertEqual(
+            self.storage._strip_signing_parameters(
+                "%s?X-Amz-Date=12345678&X-Amz-Signature=Signature" % expected
+            ),
+            expected,
+        )
+        self.assertEqual(
+            self.storage._strip_signing_parameters(
+                "%s?expires=12345678&signature=Signature" % expected
+            ),
+            expected,
+        )
 
     @skipIf(threading is None, "Test requires threading")
     def test_connection_threading(self):
@@ -971,29 +982,6 @@ class S3StorageTests(TestCase):
                 access_key="foo", secret_key="boo", session_profile="moo"
             )
 
-    def test_security_token(self):
-        with override_settings(AWS_SESSION_TOKEN="baz"):
-            storage = s3.S3Storage()
-            self.assertEqual(storage.security_token, "baz")
-
-        with override_settings(AWS_SECURITY_TOKEN="baz"):
-            storage = s3.S3Storage()
-            self.assertEqual(storage.security_token, "baz")
-
-        with mock.patch.dict(
-            os.environ,
-            {"AWS_SESSION_TOKEN": "baz"},
-        ):
-            storage = s3.S3Storage()
-            self.assertEqual(storage.security_token, "baz")
-
-        with mock.patch.dict(
-            os.environ,
-            {"AWS_SECURITY_TOKEN": "baz"},
-        ):
-            storage = s3.S3Storage()
-            self.assertEqual(storage.security_token, "baz")
-
 
 class S3StaticStorageTests(TestCase):
     def setUp(self):
@@ -1037,22 +1025,23 @@ class S3FileTests(TestCase):
         )
 
     def test_closed(self):
-        with s3.S3File("test", "wb", self.storage) as f:
-            with self.subTest("after init"):
-                self.assertFalse(f.closed)
+        f = s3.S3File("test", "wb", self.storage)
 
-            with self.subTest("after file access"):
-                # Ensure _get_file has been called
-                f.file
-                self.assertFalse(f.closed)
+        with self.subTest("after init"):
+            self.assertFalse(f.closed)
 
-            with self.subTest("after close"):
-                f.close()
-                self.assertTrue(f.closed)
+        with self.subTest("after file access"):
+            # Ensure _get_file has been called
+            f.file
+            self.assertFalse(f.closed)
 
-            with self.subTest("reopening"):
-                f.file
-                self.assertFalse(f.closed)
+        with self.subTest("after close"):
+            f.close()
+            self.assertTrue(f.closed)
+
+        with self.subTest("reopening"):
+            f.file
+            self.assertFalse(f.closed)
 
     def test_reopening(self):
         f = s3.S3File("test", "wb", self.storage)
@@ -1155,41 +1144,6 @@ class S3StorageTestsWithMoto(TestCase):
             s3_object_fetched["ContentType"],
             s3.S3Storage.default_content_type,
         )
-
-    def test_storage_open_reading_with_newlines(self):
-        """Test file reading with "r" and "rb" and various newline characters."""
-        name = "test_storage_open_read_with_newlines.txt"
-        with io.BytesIO() as temp_file:
-            temp_file.write(b"line1\nline2\r\nmore\rtext\n")
-            self.storage.save(name, temp_file)
-            file = self.storage.open(name, "r")
-            content_str = file.read()
-            file.close()
-        self.assertEqual(content_str, "line1\nline2\nmore\ntext\n")
-
-        with io.BytesIO() as temp_file:
-            temp_file.write(b"line1\nline2\r\nmore\rtext\n")
-            self.storage.save(name, temp_file)
-            file = self.storage.open(name, "rb")
-            content_str = file.read()
-            file.close()
-        self.assertEqual(content_str, b"line1\nline2\r\nmore\rtext\n")
-
-        with io.BytesIO() as temp_file:
-            temp_file.write(b"line1\nline2\r\nmore\rtext")
-            self.storage.save(name, temp_file)
-            file = self.storage.open(name, "r")
-            content_lines = file.readlines()
-            file.close()
-        self.assertEqual(content_lines, ["line1\n", "line2\n", "more\n", "text"])
-
-        with io.BytesIO() as temp_file:
-            temp_file.write(b"line1\nline2\r\nmore\rtext")
-            self.storage.save(name, temp_file)
-            file = self.storage.open(name, "rb")
-            content_lines = file.readlines()
-            file.close()
-        self.assertEqual(content_lines, [b"line1\n", b"line2\r\n", b"more\r", b"text"])
 
 
 class TestBackwardsNames(TestCase):

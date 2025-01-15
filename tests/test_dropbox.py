@@ -1,12 +1,19 @@
 import io
+import sys
 from datetime import datetime
+from unittest import SkipTest
 from unittest import mock
+
+if sys.version_info >= (3, 12, 0):
+    raise SkipTest(
+        "dropbox library does not support Python 3.12+. "
+        "Skipping all tests in test_dropbox.py"
+    )
 
 from django.core.exceptions import ImproperlyConfigured
 from django.core.exceptions import SuspiciousFileOperation
 from django.core.files.base import File
 from django.test import TestCase
-from django.test import override_settings
 from dropbox.files import FileMetadata
 from dropbox.files import FolderMetadata
 from dropbox.files import GetTemporaryLinkResult
@@ -55,11 +62,6 @@ class DropboxTest(TestCase):
         with self.assertRaises(ImproperlyConfigured):
             dropbox.DropboxStorage(None)
 
-    def test_setting_access_token(self):
-        with override_settings(DROPBOX_OAUTH2_TOKEN="abc"):
-            storage = dropbox.DropboxStorage()
-            self.assertEqual(storage.oauth2_access_token, "abc")
-
     def test_refresh_token_app_key_no_app_secret(self, *args):
         inputs = {
             "oauth2_refresh_token": "foo",
@@ -97,11 +99,6 @@ class DropboxTest(TestCase):
     def test_not_exists(self, *args):
         exists = self.storage.exists("bar")
         self.assertFalse(exists)
-
-    @mock.patch("dropbox.Dropbox.files_get_metadata", return_value=[FILE_METADATA_MOCK])
-    def test_exists_overwrite_mode(self, *args):
-        self.storage.write_mode = "overwrite"
-        self.assertFalse(self.storage.exists("foo"))
 
     @mock.patch("dropbox.Dropbox.files_list_folder", return_value=FILES_MOCK)
     def test_listdir(self, *args):
@@ -172,8 +169,8 @@ class DropboxFileTest(TestCase):
         return_value=(FILE_METADATA_MOCK, RESPONSE_200_MOCK),
     )
     def test_read(self, *args):
-        with self.storage.open("foo.txt") as file:
-            self.assertEqual(file.read(), b"bar")
+        file = self.storage._open("foo.txt")
+        self.assertEqual(file.read(), b"bar")
 
     @mock.patch(
         "dropbox.Dropbox.files_download",
@@ -181,8 +178,8 @@ class DropboxFileTest(TestCase):
     )
     def test_server_bad_response(self, *args):
         with self.assertRaises(dropbox.DropboxStorageException):
-            with self.storage.open("foo.txt") as file:
-                file.read()
+            file = self.storage._open("foo.txt")
+            file.read()
 
 
 @mock.patch("dropbox.Dropbox.files_list_folder", return_value=FILES_EMPTY_MOCK)

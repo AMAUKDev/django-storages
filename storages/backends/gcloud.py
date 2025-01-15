@@ -14,6 +14,7 @@ from storages.base import BaseStorage
 from storages.compress import CompressedFileMixin
 from storages.utils import check_location
 from storages.utils import clean_name
+from storages.utils import get_available_overwrite_name
 from storages.utils import safe_join
 from storages.utils import setting
 from storages.utils import to_bytes
@@ -38,7 +39,7 @@ CONTENT_TYPE = "content_type"
 class GoogleCloudFile(CompressedFileMixin, File):
     def __init__(self, name, mode, storage):
         self.name = name
-        self.mime_type, self.mime_encoding = mimetypes.guess_type(name)
+        self.mime_type = mimetypes.guess_type(name)[0]
         self._mode = mode
         self._storage = storage
         self.blob = storage.bucket.get_blob(name, chunk_size=storage.blob_chunk_size)
@@ -62,9 +63,10 @@ class GoogleCloudFile(CompressedFileMixin, File):
             )
             if "r" in self._mode:
                 self._is_dirty = False
-                # This automatically decompresses the file
-                self.blob.download_to_file(self._file, checksum="crc32c")
+                self.blob.download_to_file(self._file)
                 self._file.seek(0)
+            if self._storage.gzip and self.blob.content_encoding == "gzip":
+                self._file = self._decompress_file(mode=self._mode, file=self._file)
         return self._file
 
     def _set_file(self, value):
@@ -188,11 +190,8 @@ class GoogleCloudStorage(BaseStorage):
         content.name = cleaned_name
         file_object = GoogleCloudFile(name, "rw", self)
 
-        blob_params = self.get_object_parameters(name)
-        if file_object.mime_encoding and CONTENT_ENCODING not in blob_params:
-            blob_params[CONTENT_ENCODING] = file_object.mime_encoding
-
         upload_params = {}
+        blob_params = self.get_object_parameters(name)
         upload_params["predefined_acl"] = blob_params.pop("acl", self.default_acl)
         upload_params[CONTENT_TYPE] = blob_params.pop(
             CONTENT_TYPE, file_object.mime_type
@@ -240,9 +239,6 @@ class GoogleCloudStorage(BaseStorage):
                 return True
             except NotFound:
                 return False
-
-        if self.file_overwrite:
-            return False
 
         name = self._normalize_name(clean_name(name))
         return bool(self.bucket.get_blob(name))
@@ -304,7 +300,8 @@ class GoogleCloudStorage(BaseStorage):
         """
         Return public URL or a signed URL for the Blob.
 
-        To keep things snappy, the existence of blobs for public URLs is not checked.
+        The existnce of blobs are not verified for public URLs, it makes the code too
+        slow.
         """
         name = self._normalize_name(clean_name(name))
         blob = self.bucket.blob(name)
@@ -334,3 +331,9 @@ class GoogleCloudStorage(BaseStorage):
                     params[key] = value
 
             return blob.generate_signed_url(**params)
+
+    def get_available_name(self, name, max_length=None):
+        name = clean_name(name)
+        if self.file_overwrite:
+            return get_available_overwrite_name(name, max_length)
+        return super().get_available_name(name, max_length)
